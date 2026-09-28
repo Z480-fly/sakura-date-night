@@ -1,5 +1,5 @@
 /**
- * Sakura Date Night — Packwright Smith build v5
+ * Sakura Date Night — Packwright Smith build v6
  *
  * The architecture of the first build that PROVED the dimension, the shard and
  * the startup registration work is untouched:
@@ -17,6 +17,16 @@
  *      chunks and getBlock() returned undefined. v5 loads the whole island for
  *      the build and keeps it loaded.
  *
+ * v6 keeps every one of those and, on the owner's request, extends the scene
+ * in two ways only:
+ *   1. the surrounding sky IS a canopy. A ragged blossom dome built from the
+ *      two glass colours the tree already uses — red + pink stained glass and
+ *      nothing else — wraps the whole scene. Standing on the picnic you look
+ *      out (or up through the rotunda) at the canopy, and looking down past
+ *      its rim the island, the lawn and the words are all still there.
+ *   2. the I <heart> YOU area is now a real lawn: grass, grass tufts, pink
+ *      petals, flowers and a ring of small cherry trees framing the words.
+ *
  * Scene layout (ground surface y=65):
  *   y 64      grass island, sand rim, pink path ring, pond + cherry bridge
  *   y 65      "I <heart> YOU" in concrete, south of the tree
@@ -25,9 +35,16 @@
  *   y 100-106 picnic deck: log pillar, smooth quartz, pink/white checkered
  *            carpet, cake, chests, lantern posts, cherry fence railing
  *   y 94-124  eight branches sweeping out of the trunk to carry the crown
- *   y 112-133 red crown: nether wart mass, red/pink stained glass, ragged
+ *   y 112-136 red crown: nether wart mass, red/pink stained glass, ragged
  *            blossom edge, a 10 wide open rotunda straight down onto the
  *            picnic, shroomlights inside, blossom strands below
+ *   y 72-144 blossom canopy: the "sky". An ellipsoid shell of only red and
+ *            pink stained glass, r 58, springing from just outside the island
+ *            rim and closing at y 144 above the crown, with ~190 blossom
+ *            strands hanging from its underside. Its rim hangs open at y 72
+ *            so the horizon below the canopy stays visible.
+ *   y 64-73  the letters lawn: grass, short/tall grass, pink petals, flowers,
+ *            and a ring of small cherry trees framing I <heart> YOU
  */
 
 import { ItemStack, Player, system, world } from "@minecraft/server";
@@ -35,7 +52,7 @@ import { ItemStack, Player, system, world } from "@minecraft/server";
 const DIMENSION_ID = "sakura:date_night";
 const SHARD_ID = "sakura:enchanted_echo_shard";
 const RETURN_KEY = "sakura:return_location";
-const BUILT_KEY = "sakura:date_night_built_v5";
+const BUILT_KEY = "sakura:date_night_built_v6";
 const ARRIVAL_WAIT = 40;
 const COOLDOWN = 20;
 const LOAD_RADIUS = 60;
@@ -59,6 +76,13 @@ const CROWN_LAYERS = [
   [16, 10], [17, 9], [18, 8], [19, 7], [20, 6], [21, 5], [22, 4], [23, 3],
   [24, 2],
 ];
+
+// The surrounding "sky" is a canopy. Same two glass colours as the tree, no
+// other block at all, so the dome reads as one blossom. DOME_R sits just past
+// ISLAND_R (52) and DOME_H lifts the zenith to y 144, above the crown (136).
+const DOME_R = 58;
+const DOME_H = 80;
+const DOME_FLOOR = OY + 8; // rim hangs open so the horizon stays visible
 
 const STAIR_Y0 = 65;
 const STAIR_Y1 = 105;
@@ -445,26 +469,127 @@ function buildPond(d) {
   });
 }
 
+// one small cherry tree with a lantern: shared by the grove and the lawn ring
+function plantCherry(d, x, z) {
+  for (let h = 1; h <= 5; h++) set(d, x, OY + h, z, "minecraft:cherry_log");
+  sphere(d, x, OY + 6, z, 3, "minecraft:cherry_leaves");
+  sphere(d, x + 1, OY + 6, z, 2, "minecraft:cherry_leaves");
+  set(d, x + 2, OY + 1, z, "minecraft:cherry_log");
+  set(d, x + 2, OY + 2, z, "minecraft:lantern");
+}
+
 function buildGrove(d) {
   const spots = [
-    [24, 14], [-22, 18], [19, -22], [-24, -14], [30, -6], [-16, 26],
-    [16, 34], [-30, 2], [38, 18], [-38, -20],
+    [24, 14], [-22, 18], [19, -22], [-24, -14], [30, -6], [-19, 21],
+    [19, 34], [-30, 2], [38, 18], [-38, -20],
   ];
   for (const [dx, dz] of spots) {
-    task(300, () => {
-      const x = OX + dx;
-      const z = OZ + dz;
-      for (let h = 1; h <= 5; h++) set(d, x, OY + h, z, "minecraft:cherry_log");
-      sphere(d, x, OY + 6, z, 3, "minecraft:cherry_leaves");
-      sphere(d, x + 1, OY + 6, z, 2, "minecraft:cherry_leaves");
-      set(d, x + 2, OY + 1, z, "minecraft:cherry_log");
-      set(d, x + 2, OY + 2, z, "minecraft:lantern");
+    task(300, () => plantCherry(d, OX + dx, OZ + dz));
+  }
+}
+
+// the words get a real lawn under and around them, then a ring of small cherry
+// trees frames them. Runs AFTER buildIsland and BEFORE buildLetters, so the
+// concrete letters are painted on top of the grass and the tufts.
+function buildLettersGarden(d) {
+  task(900, () => {
+    for (let dz = -4; dz <= 8; dz++) {
+      for (let dx = -24; dx <= 24; dx++) {
+        const z = OZ + 27 + dz;
+        const dzc = z - OZ;
+        if (dx * dx + dzc * dzc > (ISLAND_R - 4) * (ISLAND_R - 4)) continue;
+        set(d, OX + dx, OY, z, "minecraft:grass_block");
+        set(d, OX + dx, OY - 1, z, "minecraft:dirt");
+      }
+    }
+  });
+  task(700, () => {
+    for (let dz = 26; dz <= 36; dz++) {
+      for (let dx = -24; dx <= 24; dx++) {
+        const x = OX + dx;
+        const z = OZ + dz;
+        if (dx * dx + dz * dz > (ISLAND_R - 6) * (ISLAND_R - 6)) continue;
+        const h = hash(x, 41, z);
+        if (h >= 24) continue; // thin scatter, mostly open lawn
+        // mostly plain grass, with flowers dotted through it
+        let b = "minecraft:short_grass";
+        if (h >= 21) b = "minecraft:tall_grass";
+        else if (h >= 18) b = "minecraft:pink_petals";
+        else if (h >= 15) b = "minecraft:dandelion";
+        else if (h >= 12) b = "minecraft:cornflower";
+        else if (h >= 9) b = "minecraft:poppy";
+        set(d, x, OY + 1, z, b);
+      }
+    }
+  });
+  const ring = [
+    [-25, 27], [-21, 34], [-13, 35], [-5, 36], [3, 36], [11, 35],
+    [19, 34], [25, 27],
+  ];
+  for (const [dx, dz] of ring) {
+    task(300, () => plantCherry(d, OX + dx, OZ + dz));
+  }
+}
+
+// ------------------------------------------------------------------- the sky
+// The canopy the owner asked for: the surrounding sky IS a cherry blossom,
+// built from red + pink stained glass and nothing else. An ellipsoid shell
+// springs from just outside the island rim, sweeps up over the whole grove and
+// closes high above the tree crown, so from the picnic you look out at glass
+// instead of empty void. The rim hangs open (DOME_FLOOR) so the island, the
+// lawn and the words stay visible below the canopy.
+
+function domeTopY(dist) {
+  const t = Math.min(1, dist / DOME_R);
+  return OY + Math.round(DOME_H * Math.sqrt(Math.max(0, 1 - t * t)));
+}
+
+function canopyGlass(t, h) {
+  if (t > 0.72) return h < 78 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass";
+  if (t > 0.42) return h < 48 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass";
+  return h < 20 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass";
+}
+
+function buildCanopySky(d) {
+  const r2 = DOME_R * DOME_R;
+  for (let dz = -DOME_R; dz <= DOME_R; dz++) {
+    task(320, () => {
+      for (let dx = -DOME_R; dx <= DOME_R; dx++) {
+        const dh = dx * dx + dz * dz;
+        if (dh > r2) continue;
+        const dist = Math.sqrt(dh);
+        const t = dist / DOME_R;
+        const top = domeTopY(dist) + (hash(dx, 3, dz) % 7) - 3; // organic shell
+        const thick = 1 + (hash(dx, 9, dz) < 55 ? 1 : 0) + (hash(dx, 17, dz) < 22 ? 1 : 0);
+        const b = canopyGlass(t, hash(dx, 23, dz));
+        for (let k = 0; k < thick; k++) {
+          const y = top - k;
+          if (y < DOME_FLOOR) continue; // keep the horizon open under the rim
+          set(d, OX + dx, y, OZ + dz, b);
+        }
+      }
     });
   }
+  // blossom strands hanging out of the canopy underside
+  task(1500, () => {
+    for (let i = 0; i < 190; i++) {
+      const a = (i / 190) * Math.PI * 2 * 3.7;
+      const dist = DOME_R * (0.18 + 0.79 * (((i * 7919) % 100) / 100));
+      const top = domeTopY(dist);
+      if (top < DOME_FLOOR + 4) continue;
+      const x = OX + Math.round(Math.cos(a) * dist);
+      const z = OZ + Math.round(Math.sin(a) * dist);
+      const len = 3 + (i % 7);
+      for (let h = 1; h <= len; h++) {
+        set(d, x, top - h, z, h % 3 === 0 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass");
+      }
+    }
+  });
 }
 
 function buildScene(d) {
   buildIsland(d);
+  buildLettersGarden(d);
   buildLetters(d);
   buildPond(d);
   buildGrove(d);
@@ -473,6 +598,7 @@ function buildScene(d) {
   buildStairs(d);
   buildDeck(d);
   buildCrown(d);
+  buildCanopySky(d);
 }
 
 // --------------------------------------------------------------- world logic
@@ -560,7 +686,7 @@ function goDate(player) {
           tp(player, d, { x: LANDING_X + 0.5, y: DECK_Y + 1, z: LANDING_Z + 0.5 }, { x: 15, y: 210 });
         }, 20);
       }
-      player.sendMessage("§dWelcome — the picnic is on top of the tree, stairs spiral the trunk.");
+      player.sendMessage("§dWelcome — the picnic sits under a blossom canopy, stairs spiral the trunk.");
     },
     ARRIVAL_WAIT
   );
