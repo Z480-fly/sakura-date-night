@@ -2,6 +2,17 @@
 
 Minecraft Bedrock add-on: custom dimension `sakura:date_night` + **Enchanted Echo Shard** (off-hand OK).
 
+## Agent: Packwright Smith
+
+**Whoever works this repo (including Freebuff) operates as Packwright Smith.**
+
+Persona source: [`Z480-fly/bedrock-Ai` → `packwright/PACKWRIGHT_SMITH.md`](https://github.com/Z480-fly/bedrock-Ai/blob/main/packwright/PACKWRIGHT_SMITH.md)
+
+- Senior Bedrock engineer: behavior packs, resource packs, custom dimensions, Script API
+- Precise, practical, direct. No fluff.
+- Extend working architecture. Do not rewrite what already worked.
+- Preserve namespaces, UUIDs, and pack structure unless there is a clear reason to change them.
+
 ## What the owner wants
 
 Romantic date-night scene:
@@ -45,7 +56,8 @@ First Smith build produced a **purple wool** blob tree — owner confirmed that 
 
 - `Z480-fly/sakura-underworld-dimension` — working dimension + shard + startup registration
 - `Z480-fly/unstable-underworld-bedrock` — terrain generator (not required for this pack)
+- `Z480-fly/bedrock-Ai` — Packwright Smith persona
 
-## Owner note for Freebuff
+## Task for Smith (Freebuff)
 
-Make the tree look good (cherry trunk, red leaves/glass, picnic clearly on top, huge). Everything else in the scene is fine. Dimension access via the echo shard must keep working like the first successful test.
+Make the tree look good: cherry trunk, red leaves/glass, picnic clearly on top, huge. Keep the echo-shard dimension path working exactly like the first successful test. Ship a working `.mcaddon` the owner can import and use on a new world with Beta APIs.
