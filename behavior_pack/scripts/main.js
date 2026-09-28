@@ -1,241 +1,544 @@
 /**
- * Sakura Date Night
- * Architecture matches the first pack that successfully showed the tree in sakura:date_night.
- * Only change from that build: purple canopy → cherry trunk + red leaves/glass, picnic on top.
+ * Sakura Date Night — Packwright Smith build v5
+ *
+ * The architecture of the first build that PROVED the dimension, the shard and
+ * the startup registration work is untouched:
+ *   - dimension id sakura:date_night, void generator, registered in
+ *     system.beforeEvents.startup
+ *   - item sakura:enchanted_echo_shard, off-hand usable, returns you home
+ *   - chat commands !date / !shard / !rebuild
+ *   - script builds the scene once, then a world flag stops it rebuilding
+ *
+ * v5 changes ONLY the scene, plus the two things that were actually breaking it:
+ *   1. v4 tried to set ~100k blocks inside a single tick, so the client stalled
+ *      and most writes never landed. v5 queues the build as small tasks and
+ *      spends a fixed op budget per tick.
+ *   2. v4 loaded a 6 block ticking area, so most of the island was in unloaded
+ *      chunks and getBlock() returned undefined. v5 loads the whole island for
+ *      the build and keeps it loaded.
+ *
+ * Scene layout (ground surface y=65):
+ *   y 64      grass island, sand rim, pink path ring, pond + cherry bridge
+ *   y 65      "I <heart> YOU" in concrete, south of the tree
+ *   y 64-100  cherry trunk with buttress roots
+ *   y 65-105  walkable spiral staircase (1 block spacing, ~215 degrees)
+ *   y 100-106 picnic deck: log pillar, smooth quartz, pink/white checkered
+ *            carpet, cake, chests, lantern posts, cherry fence railing
+ *   y 94-124  eight branches sweeping out of the trunk to carry the crown
+ *   y 112-133 red crown: nether wart mass, red/pink stained glass, ragged
+ *            blossom edge, a 10 wide open rotunda straight down onto the
+ *            picnic, shroomlights inside, blossom strands below
  */
+
 import { ItemStack, Player, system, world } from "@minecraft/server";
 
 const DIMENSION_ID = "sakura:date_night";
 const SHARD_ID = "sakura:enchanted_echo_shard";
 const RETURN_KEY = "sakura:return_location";
-const BUILT_KEY = "sakura:date_night_built_v4";
+const BUILT_KEY = "sakura:date_night_built_v5";
 const ARRIVAL_WAIT = 40;
 const COOLDOWN = 20;
+const LOAD_RADIUS = 60;
+const OPS_PER_TICK = 3000;
 
-const OX = 0, OY = 64, OZ = 0;
-const TREE_H = 40;
-const PICNIC_Y = OY + TREE_H + 4;
+const OX = 0;
+const OY = 64; // grass block layer
+const OZ = 0;
+
+const ISLAND_R = 52;
+const PATH_R = 14;
+const TRUNK_TOP = 100;
+
+const DECK_Y = 106; // quartz walking surface
+const DECK_R = 9;
+
+const CROWN_BASE = 112;
+const CROWN_LAYERS = [
+  [0, 12], [1, 15], [2, 17], [3, 18], [4, 19], [5, 19], [6, 19], [7, 18],
+  [8, 18], [9, 17], [10, 16], [11, 15], [12, 14], [13, 13], [14, 12], [15, 11],
+  [16, 10], [17, 9], [18, 8], [19, 7], [20, 6], [21, 5], [22, 4], [23, 3],
+  [24, 2],
+];
+
+const STAIR_Y0 = 65;
+const STAIR_Y1 = 105;
+const STAIR_A0 = Math.PI / 2;
+const STAIR_STEP = 0.092;
+const STAIR_R0 = 11;
+const STAIR_R1 = 10.4;
 
 const lastUse = new Map();
 /** @type {import("@minecraft/server").Dimension | undefined} */
 let dim;
 let building = false;
+let queue = [];
+let queueIndex = 0;
+
+function stairT(y) {
+  return (y - STAIR_Y0) / (STAIR_Y1 - STAIR_Y0);
+}
+function stairAngle(y) {
+  return STAIR_A0 + STAIR_STEP * (y - STAIR_Y0);
+}
+function stairRadius(y) {
+  return STAIR_R0 + (STAIR_R1 - STAIR_R0) * stairT(y);
+}
+
+const LANDING_ANGLE = stairAngle(STAIR_Y1);
+const LANDING_X = OX + Math.round(Math.cos(LANDING_ANGLE) * (STAIR_R1 - 1));
+const LANDING_Z = OZ + Math.round(Math.sin(LANDING_ANGLE) * (STAIR_R1 - 1));
+
+// ---------------------------------------------------------------- block utils
 
 function set(d, x, y, z, b) {
-  try { d.getBlock({ x, y, z })?.setType(b); } catch (_) {}
-}
-function disk(d, cx, cy, cz, r, b) {
-  const r2 = r * r;
-  for (let dz = -r; dz <= r; dz++)
-    for (let dx = -r; dx <= r; dx++)
-      if (dx * dx + dz * dz <= r2) set(d, cx + dx, cy, cz + dz, b);
-}
-function sphere(d, cx, cy, cz, r, b) {
-  const r2 = r * r;
-  for (let dy = -r; dy <= r; dy++)
-    for (let dz = -r; dz <= r; dz++)
-      for (let dx = -r; dx <= r; dx++)
-        if (dx * dx + dy * dy + dz * dz <= r2) set(d, cx + dx, cy + dy, cz + dz, b);
+  try {
+    const block = d.getBlock({ x, y, z });
+    if (block) block.setType(b);
+  } catch (_) {
+    /* unloaded chunk or out of world */
+  }
 }
 
-function buildPlatform(d) {
-  const R = 48;
-  for (let dz = -R; dz <= R; dz++)
-    for (let dx = -R; dx <= R; dx++) {
-      if (dx * dx + dz * dz > R * R) continue;
-      set(d, OX + dx, OY - 1, OZ + dz, "minecraft:dirt");
-      set(d, OX + dx, OY, OZ + dz, "minecraft:grass_block");
-      set(d, OX + dx, OY + 1, OZ + dz, "minecraft:air");
-      set(d, OX + dx, OY + 2, OZ + dz, "minecraft:air");
+function disk(d, cx, cy, cz, r, b) {
+  const r2 = r * r;
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dz * dz <= r2) set(d, cx + dx, cy, cz + dz, b);
     }
-  for (let a = 0; a < 64; a++) {
-    const ang = (a / 64) * Math.PI * 2;
-    set(d, OX + Math.round(Math.cos(ang) * 14), OY, OZ + Math.round(Math.sin(ang) * 14), "minecraft:pink_concrete");
+  }
+}
+
+function sphere(d, cx, cy, cz, r, b) {
+  const r2 = r * r;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (dx * dx + dy * dy + dz * dz <= r2) set(d, cx + dx, cy + dy, cz + dz, b);
+      }
+    }
+  }
+}
+
+function hash(x, y, z) {
+  const h = (x * 73856093) ^ (y * 19349663) ^ (z * 83492791);
+  return (h >>> 0) % 100;
+}
+
+function ring(d, cx, cy, cz, r, b, gap) {
+  const steps = Math.max(48, Math.round(r * 6));
+  for (let i = 0; i < steps; i++) {
+    const a = (i / steps) * Math.PI * 2;
+    if (gap && Math.abs(angleDelta(a, gap)) < 0.35) continue;
+    set(d, cx + Math.round(Math.cos(a) * r), cy, cz + Math.round(Math.sin(a) * r), b);
+  }
+}
+
+function angleDelta(a, b) {
+  let d = (a - b) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+// ------------------------------------------------------------- task queue
+
+function task(cost, fn) {
+  queue.push({ cost, fn });
+}
+
+function pump() {
+  if (!building) return;
+  let spent = 0;
+  while (queueIndex < queue.length && spent < OPS_PER_TICK) {
+    const t = queue[queueIndex++];
+    t.fn();
+    spent += t.cost;
+  }
+  if (queueIndex < queue.length) return;
+  building = false;
+  queue = [];
+  queueIndex = 0;
+  world.setDynamicProperty(BUILT_KEY, true);
+  console.warn("[DateNight] scene built");
+}
+
+system.runInterval(pump, 1);
+
+// ------------------------------------------------------------------ the scene
+
+function buildIsland(d) {
+  const r2 = ISLAND_R * ISLAND_R;
+  const rim = (ISLAND_R - 4) * (ISLAND_R - 4);
+  for (let dz = -ISLAND_R; dz <= ISLAND_R; dz++) {
+    task(160, () => {
+      for (let dx = -ISLAND_R; dx <= ISLAND_R; dx++) {
+        const dist = dx * dx + dz * dz;
+        if (dist > r2) continue;
+        const x = OX + dx;
+        const z = OZ + dz;
+        set(d, x, OY - 3, z, "minecraft:dirt");
+        set(d, x, OY - 2, z, "minecraft:dirt");
+        set(d, x, OY - 1, z, "minecraft:dirt");
+        set(d, x, OY, z, dist > rim ? "minecraft:sand" : "minecraft:grass_block");
+      }
+    });
+  }
+  // pink path ring + walkway out to the letters
+  task(320, () => {
+    ring(d, OX, OY + 1, OZ, PATH_R, "minecraft:pink_concrete");
+    for (let z = PATH_R; z <= 25; z++) {
+      set(d, OX - 1, OY + 1, OZ + z, "minecraft:pink_concrete");
+      set(d, OX, OY + 1, OZ + z, "minecraft:pink_concrete");
+      set(d, OX + 1, OY + 1, OZ + z, "minecraft:pink_concrete");
+    }
+  });
+  // lantern posts along the walkway
+  task(40, () => {
+    for (let z = 18; z <= 25; z += 7) {
+      set(d, OX - 3, OY + 1, OZ + z, "minecraft:cherry_fence");
+      set(d, OX - 3, OY + 2, OZ + z, "minecraft:lantern");
+      set(d, OX + 3, OY + 1, OZ + z, "minecraft:cherry_fence");
+      set(d, OX + 3, OY + 2, OZ + z, "minecraft:lantern");
+    }
+  });
+}
+
+function buildTrunk(d) {
+  for (let y = OY; y <= TRUNK_TOP; y++) {
+    const t = (y - OY) / (TRUNK_TOP - OY);
+    let r = Math.max(3, Math.round(6 - 3 * t));
+    if (y <= OY + 3) r += 2; // base flare
+    task(90, () => disk(d, OX, y, OZ, r, "minecraft:cherry_log"));
+  }
+  // buttress roots on the surface
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2;
+    task(60, () => {
+      for (let s = 5; s <= 12; s++) {
+        const px = OX + Math.round(Math.cos(a) * s);
+        const pz = OZ + Math.round(Math.sin(a) * s);
+        const h = s < 8 ? 3 : 2;
+        for (let i2 = 0; i2 < h; i2++) set(d, px, OY + i2, pz, "minecraft:cherry_log");
+      }
+    });
+  }
+}
+
+function buildBranches(d) {
+  // eight branches leaving the trunk low and steep so they arch over the deck
+  for (let b = 0; b < 8; b++) {
+    const a = (b / 8) * Math.PI * 2;
+    task(600, () => {
+      for (let s = 0; s <= 20; s++) {
+        const t = s / 20;
+        const r = 3.5 + 12.5 * t;
+        const y = Math.round(94 + 30 * t);
+        const th = Math.max(1, Math.round(2.4 - 1.6 * t));
+        disk(d, OX + Math.round(Math.cos(a) * r), y, OZ + Math.round(Math.sin(a) * r), th, "minecraft:cherry_log");
+      }
+    });
+  }
+}
+
+function buildCrown(d) {
+  for (const [dy, r] of CROWN_LAYERS) {
+    const y = CROWN_BASE + dy;
+    const oculus = 5; // 10 wide skylight straight down onto the picnic
+    task(1200, () => {
+      const r2 = r * r;
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const dist = dx * dx + dz * dz;
+          if (dist > r2) continue;
+          if (dist < oculus * oculus) continue; // open rotunda above the picnic
+          const x = OX + dx;
+          const z = OZ + dz;
+          const h = hash(x, y, z);
+          if (r >= 10 && dist > r2 * 0.82 && h > 55) continue; // ragged blossom edge
+          if (dist > r2 * 0.45 && h < 14) {
+            set(d, x, y, z, "minecraft:pink_stained_glass");
+          } else if (dist > r2 * 0.22 && h < 30) {
+            set(d, x, y, z, "minecraft:red_stained_glass");
+          } else {
+            set(d, x, y, z, "minecraft:nether_wart_block");
+          }
+        }
+      }
+    });
+  }
+  // warm lights inside the crown
+  task(600, () => {
+    for (const [dx, dy, dz, r] of [[11, 5, 0, 3], [-11, 4, 0, 3], [0, 6, 11, 3], [0, 5, -11, 3]]) {
+      sphere(d, OX + dx, CROWN_BASE + dy, OZ + dz, r, "minecraft:shroomlight");
+    }
+  });
+  // blossom strands hanging under the parasol
+  task(500, () => {
+    for (let i = 0; i < 56; i++) {
+      const a = (i / 56) * Math.PI * 2;
+      const r = 12.5 + (i % 3) * 0.8;
+      const len = 4 + (i % 6);
+      const x = OX + Math.round(Math.cos(a) * r);
+      const z = OZ + Math.round(Math.sin(a) * r);
+      for (let h = 0; h <= len; h++) {
+        set(d, x, CROWN_BASE - h, z, h % 3 === 0 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass");
+      }
+    }
+    for (let i = 0; i < 32; i++) {
+      const a = (i / 32) * Math.PI * 2 + 0.1;
+      const r = 17 + (i % 2);
+      const len = 3 + (i % 4);
+      const x = OX + Math.round(Math.cos(a) * r);
+      const z = OZ + Math.round(Math.sin(a) * r);
+      for (let h = 1; h <= len; h++) {
+        set(d, x, CROWN_BASE + 4 - h, z, h % 4 === 0 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass");
+      }
+    }
+  });
+  task(300, () => {
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2 + 0.26;
+      const x = OX + Math.round(Math.cos(a) * 11.5);
+      const z = OZ + Math.round(Math.sin(a) * 11.5);
+      set(d, x, CROWN_BASE, z, "minecraft:chain");
+      set(d, x, CROWN_BASE - 1, z, "minecraft:chain");
+      set(d, x, CROWN_BASE - 2, z, "minecraft:lantern");
+    }
+  });
+}
+
+function buildDeck(d) {
+  for (let y = TRUNK_TOP; y <= DECK_Y - 1; y++) {
+    task(320, () => disk(d, OX, y, OZ, DECK_R, "minecraft:cherry_log"));
+  }
+  task(320, () => disk(d, OX, DECK_Y, OZ, DECK_R, "minecraft:smooth_quartz"));
+  task(320, () => {
+    // keep head room clear over the picnic, branches only cross the outer ring
+    for (let dz = -DECK_R; dz <= DECK_R; dz++) {
+      for (let dx = -DECK_R; dx <= DECK_R; dx++) {
+        if (dx * dx + dz * dz > DECK_R * DECK_R) continue;
+        for (let y = DECK_Y + 1; y <= DECK_Y + 3; y++) set(d, OX + dx, y, OZ + dz, "minecraft:air");
+      }
+    }
+  });
+  task(200, () => {
+    for (let dz = -3; dz <= 3; dz++) {
+      for (let dx = -3; dx <= 3; dx++) {
+        set(d, OX + dx, DECK_Y + 1, OZ + dz, (dx + dz) % 2 === 0 ? "minecraft:pink_carpet" : "minecraft:white_carpet");
+      }
+    }
+    set(d, OX, DECK_Y + 2, OZ, "minecraft:cake");
+    set(d, OX + 2, DECK_Y + 1, OZ + 2, "minecraft:chest");
+    set(d, OX - 2, DECK_Y + 1, OZ + 2, "minecraft:chest");
+    set(d, OX + 2, DECK_Y + 1, OZ - 2, "minecraft:poppy");
+    set(d, OX - 2, DECK_Y + 1, OZ - 2, "minecraft:poppy");
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2 + 0.4;
+      const x = OX + Math.round(Math.cos(a) * 7.5);
+      const z = OZ + Math.round(Math.sin(a) * 7.5);
+      set(d, x, DECK_Y + 1, z, "minecraft:cherry_log");
+      set(d, x, DECK_Y + 2, z, "minecraft:lantern");
+    }
+  });
+  task(200, () => {
+    ring(d, OX, DECK_Y + 1, OZ, DECK_R, "minecraft:cherry_fence", LANDING_ANGLE);
+    // bridge the top of the stairs onto the deck
+    for (let r = Math.round(STAIR_R1) - 1; r >= DECK_R - 1; r--) {
+      const x = OX + Math.round(Math.cos(LANDING_ANGLE) * r);
+      const z = OZ + Math.round(Math.sin(LANDING_ANGLE) * r);
+      set(d, x, DECK_Y, z, "minecraft:cherry_planks");
+      set(d, x, DECK_Y + 1, z, "minecraft:air");
+    }
+  });
+  task(60, () => {
+    for (let r = DECK_R - 2; r <= DECK_R - 1; r++) {
+      set(d, OX + Math.round(Math.cos(LANDING_ANGLE) * r), DECK_Y + 1, OZ + Math.round(Math.sin(LANDING_ANGLE) * r), "minecraft:cherry_fence");
+    }
+  });
+}
+
+function buildStairs(d) {
+  for (let y = STAIR_Y0; y <= STAIR_Y1; y++) {
+    task(12, () => {
+      const a = stairAngle(y);
+      const r = stairRadius(y);
+      const x = OX + Math.round(Math.cos(a) * r);
+      const z = OZ + Math.round(Math.sin(a) * r);
+      set(d, x, y, z, "minecraft:cherry_stairs");
+      set(d, x, y + 1, z, "minecraft:air");
+      set(d, x, y + 2, z, "minecraft:air");
+      // outer handrail posts + lanterns
+      const px = OX + Math.round(Math.cos(a) * (r + 1.4));
+      const pz = OZ + Math.round(Math.sin(a) * (r + 1.4));
+      if (y % 4 === 0) set(d, px, y, pz, "minecraft:cherry_fence");
+      if (y % 16 === 0) {
+        set(d, px, y, pz, "minecraft:lantern");
+      }
+    });
   }
 }
 
 function buildLetters(d) {
-  const letters = {
-    I: ["###", " # ", " # ", " # ", "###"],
-    H: ["# #", "###", "###", " # ", "   "],
-    Y: ["# #", "# #", " # ", " # ", " # "],
-    O: ["###", "# #", "# #", "# #", "###"],
-    U: ["# #", "# #", "# #", "# #", "###"],
+  const patterns = {
+    I: ["#####", "  #  ", "  #  ", "  #  ", "#####"],
+    heart: [".#.#.", "#####", "#####", ".###.", "..#.."],
+    Y: ["#   #", " # # ", "  #  ", "  #  ", "  #  "],
+    O: [" ### ", "#   #", "#   #", "#   #", " ### "],
+    U: ["#   #", "#   #", "#   #", "#   #", " ### "],
   };
-  function paint(ox, oz, pat, b) {
-    for (let r = 0; r < pat.length; r++)
-      for (let c = 0; c < pat[r].length; c++)
-        if (pat[r][c] === "#") set(d, ox + c, OY + 1, oz + r, b);
-    return pat[0].length + 2;
-  }
-  let x = OX - 12;
-  const z = OZ - 22;
-  x += paint(x, z, letters.I, "minecraft:black_concrete");
-  x += paint(x, z, letters.H, "minecraft:red_concrete");
-  x += paint(x, z, letters.Y, "minecraft:black_concrete");
-  x += paint(x, z, letters.O, "minecraft:black_concrete");
-  paint(x, z, letters.U, "minecraft:black_concrete");
-}
-
-function buildTrunk(d) {
-  for (let y = OY; y < OY + TREE_H; y++) {
-    const t = (y - OY) / TREE_H;
-    const r = Math.max(2, Math.floor(5 * (1 - t * 0.4)));
-    disk(d, OX, y, OZ, r, "minecraft:cherry_log");
-  }
-  for (const [dx, dz] of [[10,0],[-10,0],[0,10],[0,-10],[8,8],[-8,8],[8,-8],[-8,-8]]) {
-    for (let i = 0; i <= 5; i++) {
-      const px = OX + Math.round((dx * i) / 5);
-      const pz = OZ + Math.round((dz * i) / 5);
-      for (let yy = 0; yy < Math.max(1, 4 - Math.floor(i / 2)); yy++)
-        set(d, px, OY + yy, pz, "minecraft:cherry_log");
-    }
-  }
-}
-
-function buildCanopy(d) {
-  const cy = OY + TREE_H;
-  for (const [ox, oy, oz, r] of [[0,0,0,15],[11,2,5,10],[-11,1,-4,10],[5,3,-12,9],[-6,2,11,9],[0,5,0,8]]) {
-    const r2 = r * r;
-    for (let dy = -r; dy <= Math.floor(r * 0.65); dy++)
-      for (let dz = -r; dz <= r; dz++)
-        for (let dx = -r; dx <= r; dx++) {
-          const dist = dx * dx + dy * dy * 1.25 + dz * dz;
-          if (dist > r2) continue;
-          const h = ((dx * 73856093) ^ (dy * 19349663) ^ (dz * 83492791)) >>> 0;
-          if (dist > r2 * 0.72 && (h % 100) > 55) continue;
-          if (dist > r2 * 0.5 && (h % 100) < 20)
-            set(d, OX + ox + dx, cy + oy + dy, OZ + oz + dz, "minecraft:red_stained_glass");
-          else
-            set(d, OX + ox + dx, cy + oy + dy, OZ + oz + dz, "minecraft:nether_wart_block");
+  const order = [
+    ["I", "minecraft:black_concrete"],
+    ["heart", "minecraft:red_concrete"],
+    ["Y", "minecraft:black_concrete"],
+    ["O", "minecraft:black_concrete"],
+    ["U", "minecraft:black_concrete"],
+  ];
+  task(200, () => {
+    let x = OX - 16;
+    const z = OZ + 27;
+    for (const [key, block] of order) {
+      const pat = patterns[key];
+      for (let row = 0; row < pat.length; row++) {
+        for (let col = 0; col < pat[row].length; col++) {
+          if (pat[row][col] !== "#") continue;
+          set(d, x + col, OY + 1, z + row, block);
         }
-  }
-  for (let i = 0; i < 48; i++) {
-    const ang = (i / 48) * Math.PI * 2;
-    const dist = 5 + (i % 7);
-    const hx = OX + Math.round(Math.cos(ang) * dist);
-    const hz = OZ + Math.round(Math.sin(ang) * dist);
-    const len = 5 + (i % 8);
-    for (let h = 1; h <= len; h++)
-      set(d, hx, cy - h, hz, h % 3 === 0 ? "minecraft:pink_stained_glass" : "minecraft:red_stained_glass");
-  }
-  for (const [dx, dy, dz] of [[0,1,0],[6,0,3],[-5,2,-3],[3,-1,-6]])
-    sphere(d, OX + dx, cy + dy, OZ + dz, 2, "minecraft:shroomlight");
-}
-
-function buildStairs(d) {
-  let y = OY, angle = 0;
-  while (y <= PICNIC_Y) {
-    const r = 8;
-    const sx = OX + Math.round(Math.cos(angle) * r);
-    const sz = OZ + Math.round(Math.sin(angle) * r);
-    set(d, sx, y, sz, "minecraft:cherry_stairs");
-    set(d, sx, y + 1, sz, "minecraft:air");
-    set(d, sx, y + 2, sz, "minecraft:air");
-    set(d, OX + Math.round(Math.cos(angle) * (r + 1)), y, OZ + Math.round(Math.sin(angle) * (r + 1)), "minecraft:cherry_planks");
-    set(d, OX + Math.round(Math.cos(angle) * (r + 2)), y + 1, OZ + Math.round(Math.sin(angle) * (r + 2)), "minecraft:cherry_fence");
-    angle += 0.28;
-    y += 1;
-  }
-}
-
-function buildPicnic(d) {
-  const y = PICNIC_Y;
-  for (let dz = -9; dz <= 9; dz++)
-    for (let dx = -9; dx <= 9; dx++) {
-      if (dx * dx + dz * dz > 81) continue;
-      for (let dy = 0; dy <= 5; dy++) set(d, OX + dx, y + dy, OZ + dz, "minecraft:air");
-      set(d, OX + dx, y - 1, OZ + dz, "minecraft:cherry_log");
-      set(d, OX + dx, y, OZ + dz, "minecraft:smooth_quartz");
+      }
+      x += pat[0].length + 2;
     }
-  for (let dz = -3; dz <= 3; dz++)
-    for (let dx = -3; dx <= 3; dx++)
-      set(d, OX + dx, y + 1, OZ + dz, ((dx + dz) % 2 === 0) ? "minecraft:pink_carpet" : "minecraft:white_carpet");
-  set(d, OX, y + 1, OZ, "minecraft:cake");
-  set(d, OX + 2, y + 1, OZ + 1, "minecraft:candle_cake");
-  set(d, OX - 2, y + 1, OZ - 1, "minecraft:chest");
-  for (const [dx, dz] of [[7,0],[-7,0],[0,7],[0,-7],[5,5],[-5,5],[5,-5],[-5,-5]]) {
-    set(d, OX + dx, y + 1, OZ + dz, "minecraft:cherry_log");
-    set(d, OX + dx, y + 2, OZ + dz, "minecraft:lantern");
-  }
-  for (let a = 0; a < 32; a++) {
-    const ang = (a / 32) * Math.PI * 2;
-    set(d, OX + Math.round(Math.cos(ang) * 9), y + 1, OZ + Math.round(Math.sin(ang) * 9), "minecraft:cherry_fence");
-  }
-}
-
-function buildGrove(d) {
-  for (const [dx, dz] of [[18,12],[-16,14],[14,-18],[-20,-10],[22,-8],[-12,20],[8,22],[-22,6]]) {
-    const tx = OX + dx, tz = OZ + dz;
-    for (let h = 0; h < 5; h++) set(d, tx, OY + 1 + h, tz, "minecraft:cherry_log");
-    sphere(d, tx, OY + 6, tz, 3, "minecraft:cherry_leaves");
-    set(d, tx + 2, OY + 4, tz, "minecraft:lantern");
-  }
+  });
 }
 
 function buildPond(d) {
-  const pz = OZ + 18;
-  for (let dz = -5; dz <= 5; dz++)
-    for (let dx = -8; dx <= 8; dx++) {
-      if (dx * dx / 64 + dz * dz / 25 > 1) continue;
-      set(d, OX + dx, OY - 1, pz + dz, "minecraft:dirt");
-      set(d, OX + dx, OY, pz + dz, "minecraft:water");
+  const px = OX - 30;
+  const pz = OZ + 4;
+  const rx = 12;
+  const rz = 8;
+  for (let dz = -rz - 2; dz <= rz + 2; dz++) {
+    task(200, () => {
+      for (let dx = -rx - 2; dx <= rx + 2; dx++) {
+        const e = (dx * dx) / (rx * rx) + (dz * dz) / (rz * rz);
+        if (e > 1.35) continue;
+        const x = px + dx;
+        const z = pz + dz;
+        if (e <= 1) {
+          set(d, x, OY, z, "minecraft:water");
+          set(d, x, OY - 1, z, "minecraft:water");
+          set(d, x, OY - 2, z, "minecraft:gravel");
+          if (hash(x, 0, z) < 18) set(d, x, OY + 1, z, "minecraft:lily_pad");
+        } else {
+          set(d, x, OY, z, "minecraft:coarse_dirt");
+        }
+      }
+    });
+  }
+  task(220, () => {
+    for (let dx = -rx - 3; dx <= rx + 3; dx++) {
+      set(d, px + dx, OY + 1, pz, "minecraft:cherry_planks");
+      set(d, px + dx, OY + 2, pz - 1, "minecraft:cherry_fence");
+      set(d, px + dx, OY + 2, pz + 1, "minecraft:cherry_fence");
     }
-  for (let dx = -9; dx <= 9; dx++) {
-    set(d, OX + dx, OY, pz, "minecraft:cherry_planks");
-    set(d, OX + dx, OY + 1, pz - 1, "minecraft:cherry_fence");
-    set(d, OX + dx, OY + 1, pz + 1, "minecraft:cherry_fence");
+    for (const dx of [-rx - 2, 0, rx + 2]) {
+      set(d, px + dx, OY + 2, pz - 1, "minecraft:lantern");
+      set(d, px + dx, OY + 2, pz + 1, "minecraft:lantern");
+    }
+  });
+}
+
+function buildGrove(d) {
+  const spots = [
+    [24, 14], [-22, 18], [19, -22], [-24, -14], [30, -6], [-16, 26],
+    [16, 34], [-30, 2], [38, 18], [-38, -20],
+  ];
+  for (const [dx, dz] of spots) {
+    task(300, () => {
+      const x = OX + dx;
+      const z = OZ + dz;
+      for (let h = 1; h <= 5; h++) set(d, x, OY + h, z, "minecraft:cherry_log");
+      sphere(d, x, OY + 6, z, 3, "minecraft:cherry_leaves");
+      sphere(d, x + 1, OY + 6, z, 2, "minecraft:cherry_leaves");
+      set(d, x + 2, OY + 1, z, "minecraft:cherry_log");
+      set(d, x + 2, OY + 2, z, "minecraft:lantern");
+    });
   }
 }
 
 function buildScene(d) {
-  buildPlatform(d);
+  buildIsland(d);
   buildLetters(d);
-  buildTrunk(d);
-  buildCanopy(d);
-  buildStairs(d);
-  buildPicnic(d);
-  buildGrove(d);
   buildPond(d);
+  buildGrove(d);
+  buildTrunk(d);
+  buildBranches(d);
+  buildStairs(d);
+  buildDeck(d);
+  buildCrown(d);
 }
+
+// --------------------------------------------------------------- world logic
 
 function resolveDim() {
   if (dim) return dim;
-  try { dim = world.getDimension(DIMENSION_ID); } catch (_) { dim = undefined; }
+  try {
+    dim = world.getDimension(DIMENSION_ID);
+  } catch (_) {
+    dim = undefined;
+  }
   return dim;
 }
 
-function ensureScene(d) {
-  if (world.getDynamicProperty(BUILT_KEY) === true || building) return;
-  building = true;
+function loadChunks(d) {
   try {
-    buildScene(d);
-    world.setDynamicProperty(BUILT_KEY, true);
-  } finally {
-    building = false;
+    d.runCommand(`tickingarea add circle ${OX} ${OY} ${OZ} ${LOAD_RADIUS} sakura_date_night`);
+  } catch (_) {
+    /* already exists or command unavailable: the player still loads the centre */
   }
+}
+
+function ensureScene(d) {
+  if (building || world.getDynamicProperty(BUILT_KEY) === true) return;
+  queue = [];
+  queueIndex = 0;
+  building = true;
+  buildScene(d);
 }
 
 function saveReturn(player) {
   let rot = { x: 0, y: 0 };
-  try { rot = player.getRotation(); } catch (_) {}
+  try {
+    rot = player.getRotation();
+  } catch (_) {}
   const l = player.location;
-  world.setDynamicProperty(RETURN_KEY, JSON.stringify({
-    dimension: player.dimension.id, x: l.x, y: l.y, z: l.z, pitch: rot.x, yaw: rot.y
-  }));
+  world.setDynamicProperty(
+    RETURN_KEY,
+    JSON.stringify({
+      dimension: player.dimension.id,
+      x: l.x,
+      y: l.y,
+      z: l.z,
+      pitch: rot.x,
+      yaw: rot.y,
+    })
+  );
 }
 
 function loadReturn() {
   const raw = world.getDynamicProperty(RETURN_KEY);
   if (typeof raw !== "string") return null;
-  try { return JSON.parse(raw); } catch (_) { return null; }
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
 }
 
 function tp(player, targetDim, loc, rot) {
   try {
     player.teleport({ x: loc.x, y: loc.y, z: loc.z }, { dimension: targetDim, rotation: rot });
     return true;
-  } catch (_) { return false; }
+  } catch (_) {
+    return false;
+  }
 }
 
 function goDate(player) {
@@ -246,18 +549,21 @@ function goDate(player) {
   }
   saveReturn(player);
   player.sendMessage("§dTaking you somewhere special...");
-  try { d.runCommand("tickingarea add circle 0 64 0 6 sakura_date_arrival"); } catch (_) {}
+  loadChunks(d);
 
-  system.runTimeout(() => {
-    ensureScene(d);
-    const ok = tp(player, d, { x: OX + 0.5, y: PICNIC_Y + 2, z: OZ + 0.5 }, { x: 25, y: 180 });
-    if (!ok) {
-      system.runTimeout(() => {
-        tp(player, d, { x: OX + 0.5, y: OY + 3, z: OZ - 12.5 }, { x: 20, y: 0 });
-      }, 15);
-    }
-    player.sendMessage("§dWelcome — picnic is on top of the tree. Stairs spiral up the trunk.");
-  }, ARRIVAL_WAIT);
+  system.runTimeout(
+    () => {
+      ensureScene(d);
+      const spot = { x: OX + 0.5, y: DECK_Y + 1, z: OZ + 6.5 };
+      if (!tp(player, d, spot, { x: 12, y: 180 })) {
+        system.runTimeout(() => {
+          tp(player, d, { x: LANDING_X + 0.5, y: DECK_Y + 1, z: LANDING_Z + 0.5 }, { x: 15, y: 210 });
+        }, 20);
+      }
+      player.sendMessage("§dWelcome — the picnic is on top of the tree, stairs spiral the trunk.");
+    },
+    ARRIVAL_WAIT
+  );
 }
 
 function goHome(player) {
@@ -291,11 +597,15 @@ function giveShard(player) {
   try {
     const inv = player.getComponent("minecraft:inventory")?.container;
     if (!inv) return;
-    for (let i = 0; i < inv.size; i++) if (inv.getItem(i)?.typeId === SHARD_ID) return;
+    for (let i = 0; i < inv.size; i++) {
+      if (inv.getItem(i)?.typeId === SHARD_ID) return;
+    }
     inv.addItem(new ItemStack(SHARD_ID, 1));
     player.sendMessage("§dEnchanted Echo Shard — use it for Date Night.");
   } catch (_) {}
 }
+
+// --------------------------------------------------------------------- events
 
 system.beforeEvents.startup.subscribe((event) => {
   try {
@@ -306,7 +616,9 @@ system.beforeEvents.startup.subscribe((event) => {
   }
 });
 
-system.run(() => { resolveDim(); });
+system.run(() => {
+  resolveDim();
+});
 
 world.afterEvents.itemUse.subscribe((ev) => {
   if (!(ev.source instanceof Player)) return;
@@ -322,15 +634,24 @@ world.afterEvents.playerSpawn.subscribe((ev) => {
 try {
   world.beforeEvents.chatSend.subscribe((ev) => {
     const m = ev.message.trim().toLowerCase();
-    if (m === "!date" || m === "!datenight") { ev.cancel = true; system.run(() => onUse(ev.sender)); }
-    if (m === "!shard") { ev.cancel = true; system.run(() => giveShard(ev.sender)); }
+    if (m === "!date" || m === "!datenight") {
+      ev.cancel = true;
+      system.run(() => onUse(ev.sender));
+    }
+    if (m === "!shard") {
+      ev.cancel = true;
+      system.run(() => giveShard(ev.sender));
+    }
     if (m === "!rebuild") {
       ev.cancel = true;
       system.run(() => {
         world.setDynamicProperty(BUILT_KEY, false);
         const d = resolveDim();
-        if (d) ensureScene(d);
-        ev.sender.sendMessage("§dDate Night rebuilt.");
+        if (d) {
+          loadChunks(d);
+          ensureScene(d);
+        }
+        ev.sender.sendMessage("§dDate Night rebuilding — give it a few seconds.");
       });
     }
   });
