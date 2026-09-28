@@ -1,0 +1,11 @@
+{
+  "format_version": "1.21.100",
+  "minecraft:client_biome": {
+    "description": { "identifier": "sakura:date_night" },
+    "components": {
+      "minecraft:fog_appearance": { "fog_identifier": "minecraft:fog_default" },
+      "minecraft:sky_color": { "sky_color": "#ffb6c1" },
+      "minecraft:water_appearance": { "surface_color": "#f8c8dc" }
+    }
+  }
+}
